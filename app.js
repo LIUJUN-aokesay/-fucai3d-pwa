@@ -4,15 +4,87 @@ function all(){return new Promise((ok,no)=>{let r=db.transaction('draws').object
 function get(k){return new Promise((ok,no)=>{let r=db.transaction('draws').objectStore('draws').get(k);r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error)})}
 function put(r){return new Promise((ok,no)=>{let t=db.transaction('draws','readwrite');t.objectStore('draws').add(r);t.oncomplete=ok;t.onerror=()=>no(t.error)})}
 function norm(issue,date,d){issue=String(issue).trim();date=String(date).trim();if(!/^\d{7,8}$/.test(issue))throw Error('期号须为7-8位');if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||Number.isNaN(Date.parse(date))||new Date(date+'T00:00:00Z').toISOString().slice(0,10)!==date)throw Error('日期错误');if(typeof d==='string')d=d.split('');if(!Array.isArray(d)||d.length!==3||d.some(x=>!/^\d$/.test(String(x))))throw Error('号码必须为3位数字');return {issue,date,digits:d.map(Number)}}
-async function refresh(){let a=await all();a.sort((x,y)=>y.issue.localeCompare(x.issue));$('count').textContent=a.length.toLocaleString();$('latest').textContent=a[0]?`最新：${a[0].issue}期 · ${a[0].date} · ${a[0].digits.join('')}`:'暂无记录，请先导入CSV';return a}
-async function merge(rows){let added=0,dup=0,bad=0,conflicts=[];for(let x of rows){try{let r=norm(x.issue,x.date,x.digits),old=await get(r.issue);if(old){if(old.date===r.date&&old.digits.join('')===r.digits.join(''))dup++;else conflicts.push(r.issue)}else{await put(r);added++}}catch(e){bad++}}await refresh();return {added,dup,bad,conflicts}}
-$('saveBtn').onclick=async()=>{try{$('saveMsg').textContent=JSON.stringify(await merge([{issue:$('issue').value,date:$('date').value,digits:$('number').value}]))}catch(e){$('saveMsg').textContent=e.message}};
+async function refresh(){let a=await all();a.sort((x,y)=>y.issue.localeCompare(x.issue));$('count').textContent=a.length.toLocaleString();renderRecent(a);$('latest').textContent=a[0]?`最新：${a[0].issue}期 · ${a[0].date} · ${a[0].digits.join('')}`:'暂无记录，请先导入CSV';return a}
+function renderRecent(a){
+ const node=$('recentRows');if(!node)return;
+ const recent=a.slice(0,10);
+ node.innerHTML=recent.length?recent.map(r=>{let d=r.digits,kind=new Set(d).size===3?'组选6':new Set(d).size===2?'组选3':'豹子';return `<tr><td>${r.issue}</td><td>${r.date}</td><td><strong>${d.join('')}</strong></td><td>${kind}</td></tr>`}).join(''):'<tr><td colspan="4">暂无开奖数据，请先导入CSV</td></tr>';
+}
+function candidatePool(){let six=[],three=[];for(let a=0;a<10;a++)for(let b=a;b<10;b++)for(let c=b;c<10;c++){let d=[a,b,c],sm=d.filter(x=>x<5).length,odd=d.filter(x=>x%2).length;if(![1,2].includes(sm)||![1,2].includes(odd))continue;let unique=new Set(d).size;if(unique===3)six.push(d);if(unique===2)three.push(d)}return {six,three}}
+function stableHash(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
+// V3.2: 用滚动样本外对数损失选择模型，防止直接拿历史命中率调参。
+// 模型均为启发式，不能证明对独立开奖有预测能力。
+const MODEL_WINDOWS=[0,30,100,300];
+function positionProb(history,windowSize){
+ if(!windowSize)return Array.from({length:3},()=>Array(10).fill(.1));
+ let sample=history.slice(-windowSize), alpha=20, n=sample.length;
+ let f=Array.from({length:3},()=>Array(10).fill(alpha/10));
+ for(let r of sample)r.digits.forEach((d,i)=>f[i][d]++);
+ return f.map(row=>row.map(v=>v/(n+alpha)));
+}
+function chooseModel(history){
+ // 用最近至多100期做顺序滚动验证；每一步只看此前的开奖号码。
+ const test=Math.min(100,Math.max(0,history.length-100));
+ const losses=MODEL_WINDOWS.map(()=>0);
+ for(let i=history.length-test;i<history.length;i++){
+   let prior=history.slice(0,i), actual=history[i].digits;
+   MODEL_WINDOWS.forEach((w,k)=>{
+     let probs=positionProb(prior,w);
+     losses[k]-=actual.reduce((sum,d,j)=>sum+Math.log(Math.max(1e-12,probs[j][d])),0);
+   });
+ }
+ // 仅当近期模型对数损失显著低于均匀基准时选用；否则回退均匀模型。
+ const baseline=losses[0], best=Math.min(...losses), idx=losses.indexOf(best);
+ const selected=test>=50 && idx!==0 && baseline-best>Math.max(5,2*Math.sqrt(test))?idx:0;
+ return {window:MODEL_WINDOWS[selected],test,losses,selected};
+}
+function scoreCombination(d,probs){
+ // 组选不计排列顺序：对所有不同排列的联合概率求和。
+ let keys=new Set(),score=0;
+ for(let a=0;a<3;a++)for(let b=0;b<3;b++)for(let c=0;c<3;c++){
+   if(a===b||a===c||b===c)continue;
+   let p=[d[a],d[b],d[c]],key=p.join('');if(keys.has(key))continue;
+   keys.add(key);score+=probs[0][p[0]]*probs[1][p[1]]*probs[2][p[2]];
+ }
+ return score;
+}
+function rankPick(pool,probs,key,label){
+ // 概率相同时使用期号哈希确定唯一候选，保证同一期结果稳定。
+ return pool.slice().sort((a,b)=>{
+   let diff=scoreCombination(b,probs)-scoreCombination(a,probs);
+   return Math.abs(diff)>1e-14?Math.sign(diff):stableHash(key+label+a.join(''))-stableHash(key+label+b.join(''));
+ })[0];
+}
+async function showPicks(){
+ let a=await all();a.sort((x,y)=>x.issue.localeCompare(y.issue));
+ if(!a.length){$('picks').textContent='请先导入历史数据';return}
+ let key=a[a.length-1].issue, model=chooseModel(a),probs=positionProb(a,model.window);
+ let {six,three}=candidatePool(),s=rankPick(six,probs,key,'six'),t=rankPick(three,probs,key,'three');
+ $('picks').innerHTML=`<h3>组选6 · 唯一候选</h3><div class="balls">${s.join(' ')}</div><small>${attr(s)}</small><h3>组选3 · 唯一候选</h3><div class="balls">${t.join(' ')}</div><small>${attr(t)}</small><p>依据最新已存期号 ${key} 固定。筛选模型：${model.window?`最近${model.window}期贝叶斯平滑频率`:'均匀随机基准'}；滚动验证${model.test}期。</p><small>仅符合结构偏好，不代表提高中奖概率。每组只显示一个号码，直到数据库新增期号才更新。</small>`;
+ $('modelMsg').textContent=`样本外滚动检验（对数损失，越小越好）：\n${MODEL_WINDOWS.map((w,i)=>`${w?'最近'+w+'期':'均匀基准'}：${model.losses[i].toFixed(2)}`).join('\n')}\n${model.window?'实验模型通过保守阈值，但不等于具有真实预测优势。':'未发现足够证据优于均匀基准，采用基准规则。'}`;
+}
+function recentAnalysis(a){let windows=[10,30,100],lines=[];for(let n of windows){let sample=a.slice(0,n),freq=Array(10).fill(0);for(let r of sample)for(let d of r.digits)freq[d]++;lines.push(`最近${sample.length}期数字频次：${freq.map((v,i)=>i+':'+v).join('  ')}`)}return lines.join('\n')}
+async function runBacktest(){
+ let a=await all();a.sort((x,y)=>x.issue.localeCompare(y.issue));
+ let n=Math.min(100,Math.max(0,a.length-100));if(!n){$('backtestMsg').textContent='至少需要101期数据';return}
+ let pools=candidatePool(),six=0,three=0;
+ for(let i=a.length-n;i<a.length;i++){
+   let prior=a.slice(0,i),key=prior[prior.length-1].issue;
+   // 回测时只用此前数据选模型，不能用未来结果。
+   let model=chooseModel(prior),probs=positionProb(prior,model.window);
+   let s=rankPick(pools.six,probs,key,'six'),t=rankPick(pools.three,probs,key,'three');
+   let actual=a[i].digits.slice().sort((x,y)=>x-y).join('');
+   if(s.join('')===actual)six++;if(t.join('')===actual)three++;
+ }
+ $('backtestMsg').textContent=`严格滚动回测 ${n} 期\n组选6命中 ${six} 次（随机基准期望 ${(n*.006).toFixed(2)} 次）\n组选3命中 ${three} 次（随机基准期望 ${(n*.003).toFixed(2)} 次）\n命中样本太少，不可据此推断下期中奖率。`;
+}
+async function merge(rows){let added=0,dup=0,bad=0,conflicts=[];for(let x of rows){try{let r=norm(x.issue,x.date,x.digits),old=await get(r.issue);if(old){if(old.date===r.date&&old.digits.join('')===r.digits.join(''))dup++;else conflicts.push(r.issue)}else{await put(r);added++}}catch(e){bad++}}await refresh();if(added)await showPicks();return {added,dup,bad,conflicts}}
 $('importBtn').onclick=async()=>{try{let f=$('file').files[0];if(!f)throw Error('请选CSV');let lines=(await f.text()).replace(/^\uFEFF/,'').trim().split(/\r?\n/),head=lines.shift().split(',').map(x=>x.trim());let keys=['issue','draw_date','hundreds','tens','units'];if(keys.some(k=>!head.includes(k)))throw Error('CSV字段不完整');let rows=lines.filter(Boolean).map(line=>{let c=line.split(',').map(x=>x.trim().replace(/^"|"$/g,'')),v=k=>c[head.indexOf(k)];return {issue:v('issue'),date:v('draw_date'),digits:[v('hundreds'),v('tens'),v('units')]}});$('importMsg').textContent='正在导入…';$('importMsg').textContent=JSON.stringify(await merge(rows))}catch(e){$('importMsg').textContent='错误：'+e.message}};
 $('exportBtn').onclick=async()=>{let a=await all(),csv='\uFEFFissue,draw_date,hundreds,tens,units\r\n'+a.map(r=>[r.issue,r.date,...r.digits].join(',')).join('\r\n');let u=URL.createObjectURL(new Blob([csv],{type:'text/csv'})),el=document.createElement('a');el.href=u;el.download='fucai3d_backup.csv';el.click();setTimeout(()=>URL.revokeObjectURL(u),2000)};
 $('updateBtn').onclick=async()=>{let b=$('updateBtn');b.disabled=true;$('updateMsg').textContent='联网检查中…';try{let y=new Date().getFullYear(),u=`https://raw.githubusercontent.com/wenjinliuu/lottery-data-repo/main/public_data/v2/by-year/fc3d/${y}.json`,c=new AbortController(),timer=setTimeout(()=>c.abort(),25000),r;try{r=await fetch(u,{cache:'no-store',signal:c.signal})}finally{clearTimeout(timer)}if(!r.ok)throw Error('HTTP '+r.status);let data=await r.json();if(!Array.isArray(data.draws))throw Error('数据结构异常');let rows=data.draws.sort((a,b)=>String(b.issue).localeCompare(String(a.issue))).slice(0,Number($('limit').value)).map(x=>({issue:x.issue,date:x.date,digits:x.numbers?.digits}));let result=await merge(rows);$('updateMsg').textContent='数据源最新：'+(rows[0]?.issue||'无')+'\n'+JSON.stringify(result)}catch(e){$('updateMsg').textContent='更新失败：'+e.message+'；离线功能不受影响'}finally{b.disabled=false}};
 function lg(z){let p=[.9999999999998099,676.5203681218851,-1259.1392167224028,771.3234287776531,-176.6150291621406,12.507343278686905,-.13857109526572012,9.984369578019572e-6,1.5056327351493116e-7];if(z<.5)return Math.log(Math.PI)-Math.log(Math.sin(Math.PI*z))-lg(1-z);z--;let x=p[0];for(let i=1;i<p.length;i++)x+=p[i]/(z+i);let t=z+7.5;return .5*Math.log(2*Math.PI)+(z+.5)*Math.log(t)-t+Math.log(x)}
 function chiP(x,df){let a=df/2,z=x/2;if(!z)return 1;if(z<a+1){let sum=1/a,term=sum;for(let n=1;n<500;n++){term*=z/(a+n);sum+=term;if(Math.abs(term)<Math.abs(sum)*1e-12)break}return Math.max(0,1-sum*Math.exp(-z+a*Math.log(z)-lg(a)))}let b=z+1-a,c=1e30,d=1/b,h=d;for(let i=1;i<500;i++){let an=-i*(i-a);b+=2;d=an*d+b;if(Math.abs(d)<1e-30)d=1e-30;c=b+an/c;if(Math.abs(c)<1e-30)c=1e-30;d=1/d;let v=d*c;h*=v;if(Math.abs(v-1)<1e-12)break}return Math.min(1,Math.exp(-z+a*Math.log(z)-lg(a))*h)}
-$('statsBtn').onclick=async()=>{let a=await all();if(!a.length){$('statsMsg').textContent='请先导入历史数据';return}let f=Array(10).fill(0),p=Array.from({length:3},()=>Array(10).fill(0)),shape=[0,0,0];for(let r of a){shape[new Set(r.digits).size===3?0:new Set(r.digits).size===2?1:2]++;r.digits.forEach((d,i)=>{f[d]++;p[i][d]++})}let e=a.length*3/10,chi=f.reduce((s,n)=>s+(n-e)**2/e,0),colchi=p.reduce((s,row)=>s+row.reduce((z,n)=>(z+(n-a.length/10)**2/(a.length/10)),0),0);$('statsMsg').textContent=`总期数 ${a.length}\n组选6 ${shape[0]} (${(shape[0]/a.length*100).toFixed(2)}%，理论72%)\n组选3 ${shape[1]} (${(shape[1]/a.length*100).toFixed(2)}%，理论27%)\n豹子 ${shape[2]} (${(shape[2]/a.length*100).toFixed(2)}%，理论1%)\n数字均匀性卡方 χ²=${chi.toFixed(3)}，df=9，p=${chiP(chi,9).toPrecision(5)}\n位置×数字独立性卡方 χ²=${colchi.toFixed(3)}，df=18，p=${chiP(colchi,18).toPrecision(5)}\n检验不能预测下一期。`;$('freq').innerHTML='<table><tr><th>数字</th><th>出现次数</th><th>比例</th></tr>'+f.map((n,i)=>`<tr><td>${i}</td><td>${n}</td><td>${(n/(3*a.length)*100).toFixed(2)}%</td></tr>`).join('')+'</table>'};
+$('statsBtn').onclick=async()=>{let a=await all();if(!a.length){$('statsMsg').textContent='请先导入历史数据';return}let f=Array(10).fill(0),p=Array.from({length:3},()=>Array(10).fill(0)),shape=[0,0,0];for(let r of a){shape[new Set(r.digits).size===3?0:new Set(r.digits).size===2?1:2]++;r.digits.forEach((d,i)=>{f[d]++;p[i][d]++})}let e=a.length*3/10,chi=f.reduce((s,n)=>s+(n-e)**2/e,0),colchi=p.reduce((s,row)=>s+row.reduce((z,n)=>(z+(n-a.length/10)**2/(a.length/10)),0),0);$('statsMsg').textContent=`总期数 ${a.length}\n组选6 ${shape[0]} (${(shape[0]/a.length*100).toFixed(2)}%，理论72%)\n组选3 ${shape[1]} (${(shape[1]/a.length*100).toFixed(2)}%，理论27%)\n豹子 ${shape[2]} (${(shape[2]/a.length*100).toFixed(2)}%，理论1%)\n数字均匀性卡方 χ²=${chi.toFixed(3)}，df=9，p=${chiP(chi,9).toPrecision(5)}\n位置×数字独立性卡方 χ²=${colchi.toFixed(3)}，df=18，p=${chiP(colchi,18).toPrecision(5)}\n检验不能预测下一期。`;$('recentStats').textContent=recentAnalysis(a.slice().sort((x,y)=>y.issue.localeCompare(x.issue)));$('freq').innerHTML='<table><tr><th>数字</th><th>出现次数</th><th>比例</th></tr>'+f.map((n,i)=>`<tr><td>${i}</td><td>${n}</td><td>${(n/(3*a.length)*100).toFixed(2)}%</td></tr>`).join('')+'</table>'};
 function attr(d){return `大小 ${d.filter(x=>x<5).length}小${d.filter(x=>x>=5).length}大 · 奇偶 ${d.filter(x=>x%2).length}奇${d.filter(x=>x%2===0).length}偶`}
-$('pickBtn').onclick=()=>{let six=[],three=[];for(let a=0;a<10;a++)for(let b=a;b<10;b++)for(let c=b;c<10;c++){let d=[a,b,c],sm=d.filter(x=>x<5).length,odd=d.filter(x=>x%2).length;if(![1,2].includes(sm)||![1,2].includes(odd))continue;let unique=new Set(d).size;if(unique===3)six.push(d);if(unique===2)three.push(d)}let choose=x=>x[Math.floor(Math.random()*x.length)],s=choose(six),t=choose(three);$('picks').innerHTML=`<h3>组选6候选</h3><div class="balls">${s.join(' ')}</div><small>${attr(s)}</small><h3>组选3候选</h3><div class="balls">${t.join(' ')}</div><small>${attr(t)}</small>`};
-(async()=>{try{db=await openDB();$('date').value=new Date().toLocaleDateString('en-CA');await refresh();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js').catch(()=>{})}catch(e){$('latest').textContent='本地数据库初始化失败：'+e.message}})();
+$('pickBtn').onclick=()=>showPicks();$('backtestBtn').onclick=runBacktest;
+(async()=>{try{db=await openDB();await refresh();await showPicks();if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('./sw.js').catch(()=>{})}catch(e){$('latest').textContent='本地数据库初始化失败：'+e.message}})();
